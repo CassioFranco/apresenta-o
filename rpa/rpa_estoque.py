@@ -1,13 +1,18 @@
 """RPA de cadastro de estoque a partir de uma nota fiscal (PDF).
 
 Le os itens de "DADOS DOS PRODUTOS / SERVICOS" de uma DANFE em PDF e cadastra
-cada um no sistema web de Controle de Estoque, digitando devagar e com o mouse
-visual destacado por uma bolinha vermelha.
+cada um no sistema web de Controle de Estoque, digitando com o mouse visual
+destacado por uma bolinha vermelha.
+
+Para apresentacao, o PDF e exibido em uma janela web com uma animacao que
+destaca cada item sendo lido. Em seguida a janela do PDF e fechada, o sistema
+e aberto e os itens sao cadastrados. No fim, o navegador permanece na tela do
+sistema ate a execucao ser encerrada no terminal.
 
 Uso:
     python rpa_estoque.py
     python rpa_estoque.py --pdf caminho\\nota.pdf --url http://localhost:5173/
-    python rpa_estoque.py --keep-open --delay 0.15
+    python rpa_estoque.py --delay 0.15
 
 Pre-requisitos:
     pip install -r requirements.txt
@@ -16,10 +21,13 @@ Pre-requisitos:
 """
 
 import argparse
+import html as html_lib
 import os
 import re
 import sys
+import tempfile
 import time
+from pathlib import Path
 
 import pdfplumber
 from selenium import webdriver
@@ -112,6 +120,129 @@ CURSOR_JS = r"""
 """
 
 
+PDF_PREVIEW_HTML = """<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<title>Nota Fiscal - Leitura RPA</title>
+<style>
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0;
+    padding: 24px 340px 120px 24px;
+    background: radial-gradient(circle at top, #1e293b, #0f172a 60%);
+    font-family: Arial, Helvetica, sans-serif;
+  }
+  #pdf-status {
+    position: fixed; top: 14px; left: 50%; transform: translateX(-50%);
+    z-index: 20; max-width: 68vw; padding: 10px 18px; border-radius: 999px;
+    background: rgba(15, 23, 42, .92); color: #e2e8f0;
+    font-size: 14px; font-weight: 600; letter-spacing: .1px;
+    box-shadow: 0 8px 24px rgba(0,0,0,.45); border: 1px solid rgba(148,163,184,.25);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  #pdf-progress {
+    position: fixed; top: 14px; right: 356px; z-index: 20;
+    padding: 10px 14px; border-radius: 999px;
+    background: rgba(220, 38, 38, .92); color: #fff;
+    font-size: 13px; font-weight: 700; box-shadow: 0 8px 24px rgba(0,0,0,.45);
+  }
+  #pdf-list {
+    position: fixed; top: 0; right: 0; bottom: 0; width: 310px; z-index: 15;
+    padding: 24px 20px; overflow-y: auto;
+    background: rgba(15, 23, 42, .96); border-left: 1px solid rgba(148,163,184,.2);
+    color: #cbd5e1;
+  }
+  #pdf-list h2 { margin: 0 0 4px; font-size: 16px; color: #f8fafc; }
+  #pdf-list p { margin: 0 0 16px; font-size: 12px; color: #94a3b8; line-height: 1.5; }
+  #pdf-list ul { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
+  #pdf-list li {
+    display: grid; grid-template-columns: 16px 56px 1fr; gap: 8px; align-items: start;
+    padding: 9px 10px; border-radius: 8px; font-size: 12px; line-height: 1.35;
+    background: rgba(30, 41, 59, .75); border: 1px solid transparent;
+    transition: background .25s, border-color .25s, transform .25s;
+  }
+  #pdf-list li.done { background: rgba(6, 78, 59, .65); border-color: rgba(34,197,94,.55); }
+  #pdf-list .tick { color: #64748b; font-weight: 700; transition: color .25s; }
+  #pdf-list li.done .tick { color: #22c55e; }
+  #pdf-list .code { font-weight: 700; color: #e2e8f0; }
+  #pdf-list .desc { color: #94a3b8; }
+  #pdf-list li.done .desc { color: #bbf7d0; }
+  #pages { position: relative; }
+  .pdf-page {
+    position: relative; margin: 0 auto 28px; background: #fff;
+    border-radius: 4px; box-shadow: 0 18px 45px rgba(0, 0, 0, .5);
+    overflow: hidden; opacity: 0; animation: pageIn .5s ease forwards;
+  }
+  .pdf-page:nth-child(2) { animation-delay: .12s; }
+  .pdf-page:nth-child(3) { animation-delay: .24s; }
+  @keyframes pageIn {
+    from { opacity: 0; transform: translateY(14px) scale(.995); }
+    to { opacity: 1; transform: translateY(0) scale(1); }
+  }
+  .word {
+    position: absolute; white-space: pre; color: #111827;
+    font-family: Arial, Helvetica, sans-serif; line-height: 1;
+  }
+  .pdf-highlight {
+    position: absolute; border-radius: 3px; pointer-events: none;
+    background: transparent; border: 1px solid transparent;
+    transition: background .28s ease, border-color .28s ease, box-shadow .28s ease;
+  }
+  .pdf-highlight.reading {
+    background: rgba(250, 204, 21, .38);
+    border-color: rgba(250, 204, 21, 1);
+    box-shadow: 0 0 0 2px rgba(250, 204, 21, .55), 0 0 18px rgba(250, 204, 21, .75);
+  }
+  .pdf-highlight.read {
+    background: rgba(34, 197, 94, .16);
+    border-color: rgba(34, 197, 94, .55);
+  }
+</style>
+</head>
+<body>
+<div id="pdf-status">Abrindo nota fiscal...</div>
+<div id="pdf-progress">0 / __TOTAL__</div>
+<aside id="pdf-list">
+  <h2>Itens da nota</h2>
+  <p>O RPA está lendo os produtos do PDF.</p>
+  <ul>__ITEMS__</ul>
+</aside>
+<main id="pages">__PAGES__</main>
+<script>
+const statusEl = document.getElementById('pdf-status');
+const progressEl = document.getElementById('pdf-progress');
+const boxes = Array.from(document.querySelectorAll('.pdf-highlight'));
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+window.__rpaPdfDone = false;
+window.__rpaStartReading = async function () {
+  await sleep(700);
+  for (let i = 0; i < boxes.length; i += 1) {
+    const box = boxes[i];
+    const li = document.getElementById('pdf-li-' + i);
+    box.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    statusEl.textContent = box.dataset.label;
+    progressEl.textContent = (i + 1) + ' / ' + boxes.length;
+    await sleep(700);
+    box.classList.add('reading');
+    if (li) li.classList.add('done');
+    await sleep(620);
+    box.classList.remove('reading');
+    box.classList.add('read');
+  }
+  statusEl.textContent = 'Leitura concluída — ' + boxes.length + ' itens encontrados.';
+  progressEl.textContent = boxes.length + ' / ' + boxes.length;
+  await sleep(1100);
+  window.__rpaPdfDone = true;
+};
+</script>
+</body>
+</html>
+"""
+
+
 def cluster_rows(words, tol=3.0):
     if not words:
         return []
@@ -136,53 +267,202 @@ def parse_pdf_items(pdf_path):
     if not os.path.isfile(pdf_path):
         raise FileNotFoundError("PDF nao encontrado: %s" % pdf_path)
 
-    words = []
+    pages = []
     with pdfplumber.open(pdf_path) as pdf:
         for page in pdf.pages:
-            for word in page.extract_words(
-                use_text_flow=False,
-                keep_blank_chars=False,
-                extra_attrs=["size"],
-            ):
-                if word.get("size", 0) <= MAX_FONT_SIZE:
-                    words.append(word)
+            pages.append(
+                [
+                    word
+                    for word in page.extract_words(
+                        use_text_flow=False,
+                        keep_blank_chars=False,
+                        extra_attrs=["size"],
+                    )
+                    if word.get("size", 0) <= MAX_FONT_SIZE
+                ]
+            )
 
-    rows = cluster_rows(words)
     items = []
     started = False
-    for row in rows:
-        joined = " ".join(word["text"] for word in row).strip()
-        upper = joined.upper()
+    for page_index, words in enumerate(pages):
+        for row in cluster_rows(words):
+            joined = " ".join(word["text"] for word in row).strip()
+            upper = joined.upper()
 
-        if not started:
-            if "COD." in upper and "DESCRICAO" in upper:
-                started = True
-            continue
+            if not started:
+                if "COD." in upper and "DESCRICAO" in upper:
+                    started = True
+                continue
 
-        if ("CALCULO" in upper and "IMPOSTO" in upper) or (
-            "BASE" in upper and "ICMS" in upper
-        ):
-            break
+            if ("CALCULO" in upper and "IMPOSTO" in upper) or (
+                "BASE" in upper and "ICMS" in upper
+            ):
+                return items
 
-        match = PRODUCT_ROW_RE.match(joined)
-        if not match:
-            continue
+            match = PRODUCT_ROW_RE.match(joined)
+            if not match:
+                continue
 
-        quantity = re.sub(r"[^\d]", "", match.group("qty")) or "0"
-        items.append(
-            {
-                "code": match.group("code"),
-                "description": match.group("desc").strip(),
-                "quantity": quantity,
-                "unit_price": match.group("price").strip(),
+            quantity = re.sub(r"[^\d]", "", match.group("qty")) or "0"
+            box = {
+                "x0": min(word["x0"] for word in row),
+                "top": min(word["top"] for word in row),
+                "x1": max(word["x1"] for word in row),
+                "bottom": max(word["bottom"] for word in row),
             }
-        )
+            items.append(
+                {
+                    "code": match.group("code"),
+                    "description": match.group("desc").strip(),
+                    "quantity": quantity,
+                    "unit_price": match.group("price").strip(),
+                    "_page": page_index,
+                    "_box": box,
+                }
+            )
 
     return items
 
 
+def extract_pdf_layout(pdf_path):
+    layout = []
+    with pdfplumber.open(pdf_path) as pdf:
+        for page in pdf.pages:
+            words = page.extract_words(
+                use_text_flow=False,
+                keep_blank_chars=False,
+                extra_attrs=["size"],
+            )
+
+            watermark_words = set()
+            for row in cluster_rows(words):
+                joined = " ".join(word["text"] for word in row).upper()
+                if "SEM VALOR FISCAL" in joined:
+                    watermark_words.update(id(word) for word in row)
+
+            layout.append(
+                {
+                    "width": page.width,
+                    "height": page.height,
+                    "words": [
+                        {
+                            "text": word["text"],
+                            "x0": word["x0"],
+                            "top": word["top"],
+                            "size": word.get("size", 8.0),
+                        }
+                        for word in words
+                        if id(word) not in watermark_words
+                    ],
+                }
+            )
+    return layout
+
+
+def build_pdf_preview(pdf_path, items, output_path):
+    layout = extract_pdf_layout(pdf_path)
+    max_width = max((page["width"] for page in layout), default=595.0)
+    scale = min(1.45, 900.0 / max_width) if max_width else 1.45
+
+    pages_html = []
+    for page_index, page in enumerate(layout):
+        parts = [
+            '<div class="pdf-page" style="width:%.1fpx;height:%.1fpx">'
+            % (page["width"] * scale, page["height"] * scale)
+        ]
+        for word in page["words"]:
+            parts.append(
+                '<span class="word" style="left:%.1fpx;top:%.1fpx;font-size:%.1fpx">%s</span>'
+                % (
+                    word["x0"] * scale,
+                    word["top"] * scale,
+                    max(word["size"] * scale, 1.0),
+                    html_lib.escape(word["text"]),
+                )
+            )
+
+        for index, item in enumerate(items):
+            if item.get("_page") != page_index:
+                continue
+            box = item["_box"]
+            label = "Lendo item %d de %d: %s - %s" % (
+                index + 1,
+                len(items),
+                item["code"],
+                item["description"],
+            )
+            parts.append(
+                '<div class="pdf-highlight" id="pdf-box-%d" data-label="%s" '
+                'style="left:%.1fpx;top:%.1fpx;width:%.1fpx;height:%.1fpx"></div>'
+                % (
+                    index,
+                    html_lib.escape(label, quote=True),
+                    (box["x0"] - 3) * scale,
+                    (box["top"] - 2) * scale,
+                    (box["x1"] - box["x0"] + 6) * scale,
+                    (box["bottom"] - box["top"] + 4) * scale,
+                )
+            )
+        parts.append("</div>")
+        pages_html.append("".join(parts))
+
+    sidebar = []
+    for index, item in enumerate(items):
+        sidebar.append(
+            '<li id="pdf-li-%d"><span class="tick">&#9675;</span>'
+            '<span class="code">%s</span><span class="desc">%s</span></li>'
+            % (index, html_lib.escape(item["code"]), html_lib.escape(item["description"]))
+        )
+
+    document = (
+        PDF_PREVIEW_HTML.replace("__TOTAL__", str(len(items)))
+        .replace("__ITEMS__", "".join(sidebar))
+        .replace("__PAGES__", "".join(pages_html))
+    )
+    with open(output_path, "w", encoding="utf-8") as handle:
+        handle.write(document)
+    return output_path
+
+
+def show_pdf_reading(driver, pdf_path, items, log=print):
+    preview_path = os.path.join(tempfile.gettempdir(), "rpa_nota_fiscal_preview.html")
+    build_pdf_preview(pdf_path, items, preview_path)
+
+    opened = False
+    try:
+        log("[pdf] Abrindo a nota fiscal na web...")
+        driver.switch_to.new_window("tab")
+        opened = True
+        driver.get(Path(preview_path).resolve().as_uri())
+
+        WebDriverWait(driver, 15).until(
+            lambda current: current.execute_script(
+                "return typeof window.__rpaStartReading === 'function';"
+            )
+        )
+        driver.execute_script("window.__rpaStartReading();")
+
+        timeout = 25 + len(items) * 2
+        WebDriverWait(driver, timeout).until(
+            lambda current: current.execute_script("return window.__rpaPdfDone === true;")
+        )
+
+        log("[pdf] Leitura concluida: %d item(ns). Fechando a nota..." % len(items))
+        time.sleep(0.6)
+    except Exception as exc:
+        log("[pdf] AVISO: falha ao animar a leitura (%s)." % exc)
+    finally:
+        if opened:
+            try:
+                driver.close()
+            except Exception:
+                pass
+            driver.switch_to.window(driver.window_handles[0])
+            time.sleep(0.4)
+
+
 class RpaBot:
-    def __init__(self, driver, type_delay=0.12, cursor=True, log=print):
+    def __init__(self, driver, type_delay=0.03, cursor=True, log=print):
         self.driver = driver
         self.type_delay = type_delay
         self.cursor = cursor
@@ -215,7 +495,7 @@ class RpaBot:
             element,
         )
 
-    def move_to(self, element, pause=0.55):
+    def move_to(self, element, pause=0.18):
         if not self.cursor:
             return
         point = self._center(element)
@@ -232,7 +512,7 @@ class RpaBot:
             element.click()
         except WebDriverException:
             self.driver.execute_script("arguments[0].click();", element)
-        time.sleep(0.35)
+        time.sleep(0.12)
 
     def slow_type(self, element, text):
         self.move_to(element)
@@ -245,7 +525,7 @@ class RpaBot:
             element.send_keys(char)
             time.sleep(self.type_delay)
 
-    def wait_toast_gone(self, timeout=6):
+    def wait_toast_gone(self, timeout=1.2):
         try:
             WebDriverWait(self.driver, timeout).until(
                 EC.invisibility_of_element_located((By.CSS_SELECTOR, '[role="status"]'))
@@ -283,14 +563,14 @@ def login(bot, url):
     driver = bot.driver
     bot.log("[login] Abrindo %s" % url)
     driver.get(url)
-    time.sleep(2)
+    time.sleep(1)
     bot.inject_cursor()
 
     driver.execute_script(
         "try { localStorage.removeItem('%s'); } catch (e) {}" % SESSION_KEY
     )
     driver.refresh()
-    time.sleep(1.5)
+    time.sleep(0.8)
     bot.inject_cursor()
 
     username = bot.wait_visible(XP_USERNAME)
@@ -358,7 +638,6 @@ def register_items(bot, items):
         existing.add(code.lower())
         created += 1
         bot.log("%s OK        codigo %s cadastrado." % (prefix, code))
-        bot.wait_toast_gone()
 
     return created, skipped
 
@@ -371,10 +650,14 @@ def main():
     parser = argparse.ArgumentParser(description="RPA de cadastro de estoque via PDF.")
     parser.add_argument("--pdf", default=default_pdf, help="Caminho do PDF da nota fiscal.")
     parser.add_argument("--url", default=APP_URL, help="URL do sistema web.")
-    parser.add_argument("--delay", type=float, default=0.12, help="Segundos por caractere.")
+    parser.add_argument("--delay", type=float, default=0.03, help="Segundos por caractere.")
     parser.add_argument("--headless", action="store_true", help="Executa sem janela visivel.")
     parser.add_argument("--no-cursor", action="store_true", help="Desativa a bolinha vermelha.")
-    parser.add_argument("--keep-open", action="store_true", help="Mantem o navegador aberto no fim.")
+    parser.add_argument(
+        "--keep-open",
+        action="store_true",
+        help="Compatibilidade: o navegador ja permanece aberto no fim.",
+    )
     args = parser.parse_args()
 
     print("=" * 68)
@@ -389,30 +672,45 @@ def main():
         print("Nenhum item encontrado no PDF. Verifique o caminho/formatos do arquivo.")
         return 1
 
-    print("Itens lidos do PDF (%d):" % len(items))
-    for i, item in enumerate(items, start=1):
-        print(
-            "  %2d) cod=%-5s qtd=%-6s unit=R$ %-10s %s"
-            % (i, item["code"], item["quantity"], item["unit_price"], item["description"])
-        )
-    print()
-
     driver = create_driver(headless=args.headless)
     bot = RpaBot(driver, type_delay=args.delay, cursor=not args.no_cursor)
+    success = False
 
     try:
+        show_pdf_reading(driver, args.pdf, items)
+
+        print("Itens lidos do PDF (%d):" % len(items))
+        for i, item in enumerate(items, start=1):
+            print(
+                "  %2d) cod=%-5s qtd=%-6s unit=R$ %-10s %s"
+                % (
+                    i,
+                    item["code"],
+                    item["quantity"],
+                    item["unit_price"],
+                    item["description"],
+                )
+            )
+        print()
+
         login(bot, args.url)
         created, skipped = register_items(bot, items)
+        success = True
 
         print()
         print("=" * 68)
         print(" RESULTADO: %d cadastrado(s), %d pulado(s), total %d." % (created, skipped, len(items)))
         print("=" * 68)
-
-        if args.keep_open:
-            input("Pressione ENTER para fechar o navegador...")
+        print()
+        print("O sistema permanece aberto na tela.")
+        print("Para encerrar a apresentacao, feche esta execucao no terminal (Ctrl+C).")
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\nExecucao encerrada pelo usuario. Navegador mantido aberto.")
     finally:
-        driver.quit()
+        if not success:
+            driver.quit()
 
     return 0
 
